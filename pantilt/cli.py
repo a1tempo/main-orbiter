@@ -335,6 +335,12 @@ def cmd_live(args, cfg) -> int:
             try:
                 if args.scan:
                     _live_scan(args, cfg, pt, live, record)
+                elif args.gui:
+                    from .gui import run_live_gui
+
+                    if run_live_gui(cfg, pt, camera, live, record, m.log_every_s, crop,
+                                    args.step):
+                        return 1
                 elif args.no_keys:
                     _live_print(live, record, m.log_every_s)
                 else:
@@ -572,6 +578,7 @@ def build_parser() -> argparse.ArgumentParser:
     lv.add_argument("--no-preview", action="store_true", help="don't serve the browser live view")
     lv.add_argument("--port", type=int, help="live view port (default: preview_port)")
     lv.add_argument("--no-keys", action="store_true", help="no keyboard control; print predictions")
+    lv.add_argument("--gui", action="store_true", help="open a window with the camera, arrow-key control and the live label")
     lv.add_argument("--step", type=int, default=2, help="degrees per key press (default 2)")
     lv.add_argument("--scan", action="store_true", help="raster-scan and classify at each pose")
     lv.add_argument("--pan", nargs=2, type=float, metavar=("MIN", "MAX"), help="scan pan range")

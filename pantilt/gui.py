@@ -1,7 +1,7 @@
 """Gui for aiming the camera and teaching the board corners.
 
-`pantilt keys --gui` and `pantilt teach --gui` opens a gui instead of the curses
-screen. It has to run where the camera is (the pi or through ssh with X forwarding).
+`pantilt keys --gui`, `pantilt teach --gui` and `pantilt live --gui` open a gui instead of the
+terminal screen. It has to run where the camera is (the pi or through ssh with X forwarding).
 """
 
 from __future__ import annotations
@@ -106,25 +106,111 @@ class AimSession:
         return "\n".join(lines)
 
 
-def run_gui(cfg: Config, *, teach: bool, crop: float, corners_file: str | Path,
-            step: float = 2) -> int:
+def _open_root(title: str):
+    """(tkinter, window), or None with a message if there's no tkinter or no display."""
     try:
         import tkinter as tk
     except ImportError:
         print("tkinter is missing.")
-        return 1
-    from io import BytesIO
-
-    from PIL import Image
-
-    from .cli import _Camera
-
+        return None
     try:
         root = tk.Tk()
     except tk.TclError as e:
         print(f"can't open a window ({e}). On the Pi, use its own monitor, or ssh -X on a remote machine.")
+        return None
+    root.title(title)
+    return tk, root
+
+
+def _window(tk, root, cfg: Config, camera, session: AimSession, crop: float, extra=None) -> None:
+    """Create and display main window for the pan-tilt camera interface."""
+    from io import BytesIO
+    from PIL import Image
+
+    teach = session.teach
+    cw = 960
+    ch = round(cw * cfg.camera.preview_height / cfg.camera.preview_width)
+    box = crop * ch  # the red box is a square, crop x the frame height
+
+    canvas = tk.Canvas(root, width=cw, height=ch, bg="black", highlightthickness=0)
+    canvas.grid(row=0, column=0)
+    picture = canvas.create_image(0, 0, anchor="nw")
+    x, y = cw / 2, ch / 2
+    # green crosshair
+    canvas.create_line(x - 15, y, x + 15, y, fill="#00ff78")
+    canvas.create_line(x, y - 15, x, y + 15, fill="#00ff78")
+    # red box 
+    canvas.create_rectangle(x - box / 2, y - box / 2, x + box / 2, y + box / 2,
+                            outline="#ff4646", width=2)
+
+    side = tk.Frame(root, padx=10, pady=10)
+    side.grid(row=0, column=1, sticky="n")
+    readout = tk.Label(side, justify="left", anchor="nw", font=("Menlo", 12), width=34, height=18)
+    readout.pack(anchor="w")
+
+    def save():
+        if session.save():
+            root.destroy()
+
+    # One table drives both the buttons and the keys.
+    actions = [
+        ("Center", "c", session.center),
+        ("Release servos", "r", session.release),
+        ("Smaller step", "-_", session.smaller_step),
+        ("Bigger step", "+=", session.bigger_step),
+    ]
+    if teach:
+        actions += [
+            ("Mark corner", "m ", session.mark),
+            ("Undo last", "u", session.undo),
+            ("Go to the marks", "g", session.revisit),
+            ("Save and finish", "s", save),
+        ]
+    actions.append(("Quit", "q", root.destroy))
+
+    keys = {
+        "Up": lambda: session.move(tilt_dir=+1), "Down": lambda: session.move(tilt_dir=-1),
+        "Right": lambda: session.move(pan_dir=+1), "Left": lambda: session.move(pan_dir=-1),
+        "Escape": root.destroy,
+    }
+    for label, chars, action in actions:
+        tk.Button(side, text=f"{label} ({chars[0]})", command=action).pack(fill="x", pady=1)
+        keys.update(dict.fromkeys(chars, action))
+    tk.Label(side, text="use arrow keys to move", fg="gray").pack(pady=(8, 0))
+
+    def on_key(event):
+        action = keys.get(event.keysym) or keys.get(event.char.lower())
+        if action:
+            action()
+
+    root.bind("<Key>", on_key)
+    root.focus_force()
+
+    def tick():
+        try:
+            frame = camera.grab()[:, :, :3]  # drop the unused 4th channel if present
+            buf = BytesIO()
+            Image.fromarray(frame).resize((cw, ch)).save(buf, "PPM")
+            canvas.photo = tk.PhotoImage(data=buf.getvalue())  # kept so tkinter doesn't drop it
+            canvas.itemconfig(picture, image=canvas.photo)
+        except Exception as e:
+            session.msg = f"camera: {e}"
+        text = session.status_text()
+        readout.config(text=f"{extra()}\n\n{text}" if extra else text)
+        root.after(40, tick)
+
+    tick()
+    root.mainloop()
+
+
+def run_gui(cfg: Config, *, teach: bool, crop: float, corners_file: str | Path, step: float = 2) -> int:
+    opened = _open_root("Teach the board corners" if teach else "Pan-tilt control")
+    if not opened:
         return 1
-    root.title("Teach the board corners" if teach else "Pan-tilt control")
+    tk, root = opened
+
+    from .cli import _Camera
+
     try:
         camera = _Camera(cfg, preview=False, port=None, status=None)
     except Exception as e:
@@ -132,82 +218,11 @@ def run_gui(cfg: Config, *, teach: bool, crop: float, corners_file: str | Path,
         print(f"Couldn't start the camera: {e}")
         return 1
 
-    cw = 960
-    ch = round(cw * cfg.camera.preview_height / cfg.camera.preview_width)
-    box = crop * ch  # the red box is a square, crop x the frame height
-
     with PanTilt(cfg) as pt:
         pt.center(smooth=False)
         session = AimSession(pt, teach, corners_file, step)
-
-        # The picture, with the green crosshair and the red box the model judges.
-        canvas = tk.Canvas(root, width=cw, height=ch, bg="black", highlightthickness=0)
-        canvas.grid(row=0, column=0)
-        picture = canvas.create_image(0, 0, anchor="nw")
-        x, y = cw / 2, ch / 2
-        canvas.create_line(x - 15, y, x + 15, y, fill="#00ff78")
-        canvas.create_line(x, y - 15, x, y + 15, fill="#00ff78")
-        canvas.create_rectangle(x - box / 2, y - box / 2, x + box / 2, y + box / 2,
-                                outline="#ff4646", width=2)
-
-        side = tk.Frame(root, padx=10, pady=10)
-        side.grid(row=0, column=1, sticky="n")
-        readout = tk.Label(side, justify="left", anchor="nw", font=("Menlo", 12), width=34, height=14)
-        readout.pack(anchor="w")
-
-        def save():
-            if session.save():
-                root.destroy()
-
-        # One table drives both the buttons and the keys. The first key shows on the button.
-        actions = [
-            ("Center", "c", session.center),
-            ("Release servos", "r", session.release),
-            ("Smaller step", "-_", session.smaller_step),
-            ("Bigger step", "+=", session.bigger_step),
-        ]
-        if teach:
-            actions += [
-                ("Mark corner", "m ", session.mark),
-                ("Undo last", "u", session.undo),
-                ("Go to the marks", "g", session.revisit),
-                ("Save and finish", "s", save),
-            ]
-        actions.append(("Quit", "q", root.destroy))
-
-        keys = {
-            "Up": lambda: session.move(tilt_dir=+1), "Down": lambda: session.move(tilt_dir=-1),
-            "Right": lambda: session.move(pan_dir=+1), "Left": lambda: session.move(pan_dir=-1),
-            "Escape": root.destroy,
-        }
-        for label, chars, action in actions:
-            tk.Button(side, text=f"{label} ({chars[0]})", command=action).pack(fill="x", pady=1)
-            keys.update(dict.fromkeys(chars, action))
-        tk.Label(side, text="use arrow keys to move", fg="gray").pack(pady=(8, 0))
-
-        def on_key(event):
-            action = keys.get(event.keysym) or keys.get(event.char.lower())
-            if action:
-                action()
-
-        root.bind("<Key>", on_key)
-        root.focus_force()
-
-        def tick():
-            try:
-                frame = camera.grab()[:, :, :3]  # drop the unused 4th channel if present
-                buf = BytesIO()
-                Image.fromarray(frame).resize((cw, ch)).save(buf, "PPM")
-                canvas.photo = tk.PhotoImage(data=buf.getvalue())  # kept so tkinter doesn't drop it
-                canvas.itemconfig(picture, image=canvas.photo)
-            except Exception as e:
-                session.msg = f"camera: {e}"
-            readout.config(text=session.status_text())
-            root.after(40, tick)
-
-        tick()
         try:
-            root.mainloop()
+            _window(tk, root, cfg, camera, session, crop)
         finally:
             camera.close()
         if teach:
@@ -221,3 +236,34 @@ def run_gui(cfg: Config, *, teach: bool, crop: float, corners_file: str | Path,
         return 0
     print("quit without saving")
     return 1
+
+
+def run_live_gui(cfg: Config, pt, camera, live, record, every: float, crop: float, step: float = 2) -> int:
+    """`pantilt live --gui`: the aiming window plus live classifier results.
+
+    pt, camera and live (the classifier thread) are already open
+    """
+    opened = _open_root("Live classification")
+    if not opened:
+        return 1
+    tk, root = opened
+    pt.center(smooth=False)
+    session = AimSession(pt, False, "", step)
+    last_log = [0.0]
+
+    def live_text() -> str:
+        if live.error:
+            return f"classifier stopped: {live.error}"
+        now = time.time()
+        if now - last_log[0] >= every:
+            record()
+            last_log[0] = now
+        p = live.latest
+        return "\n".join([
+            f"class = {p.label}   {p.confidence * 100:5.1f}%",
+            *[f"   {n:<14} {v * 100:5.1f}%" for n, v in p.top3[1:]],
+            f"fps   = {p.fps:5.1f}    hailo = {p.infer_ms:5.1f} ms",
+        ])
+
+    _window(tk, root, cfg, camera, session, crop, extra=live_text)
+    return 0

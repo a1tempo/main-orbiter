@@ -75,6 +75,7 @@ properly if the outline reaches them.
 | What | Command |
 |---|---|
 | Live classification, aim with the arrow keys | `pantilt live` |
+| Live, in a window with the camera and the label | `pantilt live --crop 0.2 --gui` |
 | Live, at a different crop | `pantilt live --crop 0.3` |
 | Live, logging predictions to a CSV | `pantilt live --log data/live.csv` |
 | Live, no keyboard, print one prediction per second | `pantilt live --no-keys` |
