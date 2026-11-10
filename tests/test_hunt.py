@@ -106,10 +106,15 @@ def rig(request, monkeypatch, tmp_path):
         def close(self): pass
 
     class FakeHailo:
-        def __init__(self, hef): pass
+        """Like HailoClassifier: classify(), plus the raw 8-bit output used by fault injection."""
+        scale = 1 / 255
+        def __init__(self, hef, raw_output=False): self.raw_output = raw_output
         def __enter__(self): return self
         def __exit__(self, *e): pass
         def classify(self, x): return crater_score(x)
+        def infer_raw(self, x):
+            return np.clip(np.round(crater_score(x) / self.scale), 0, 255).astype(np.uint8)
+        def dequant(self, q): return np.asarray(q, np.float32) * self.scale
 
     monkeypatch.setattr(stream, "CameraStream", FakeStream)
     monkeypatch.setattr(cli, "_Camera", FakeCamera)
@@ -391,3 +396,51 @@ def test_crater_near_the_outline_needs_edge_margin(rig, margin, photos):
     assert len(saved) == photos
     if photos:
         assert (float(saved[0]["pan"]), float(saved[0]["tilt"])) == pytest.approx(EDGE_CRATER, abs=1.0)
+
+
+def _scan(cfg, tmp, name, *extra):
+    out = tmp / name
+    args = build_parser().parse_args(["board-scan", "--hef", str(tmp / "m.hef"), "--out", str(out),
+                                      "--threshold", "0.7", "--no-preview", *extra])
+    assert bs.cmd_board_scan(args, cfg) == 0
+    return out
+
+
+def test_board_scan_with_zero_fault_bits_matches_a_clean_scan(rig):
+    cfg, tmp = rig
+    bs.cmd_calibrate_step(build_parser().parse_args(["calibrate-step"]), cfg)
+    clean = _scan(cfg, tmp, "clean")
+    zero = _scan(cfg, tmp, "zero", "--fault", "output", "--fault-bits", "0")
+
+    def saved(run):
+        return [(c["pan"], c["tilt"], float(c["confirm_p"]))
+                for c in csv.DictReader((run / "candidates.csv").open()) if c["action"] == "saved"]
+
+    (z,), (c,) = saved(zero), saved(clean)   # same single crater photographed...
+    assert z[:2] == c[:2]                      # ...at the same spot...
+    # ...and the same score, up to the fake chip's 8-bit rounding (the clean fake skips it).
+    assert z[2] == pytest.approx(c[2], abs=1 / 255)
+    rows = list(csv.DictReader((zero / "faults.csv").open()))
+    assert rows and all(r["changed"] == "0" and r["flipped"] == "" for r in rows)
+    assert {r["stage"].split()[0] for r in rows} >= {"scan", "revisit"}   # every stage logged
+    assert json.loads((zero / "run.json").read_text())["fault"] == {"mode": "output", "bits": 0, "seed": 0}
+    assert json.loads((clean / "run.json").read_text())["fault"] is None
+    assert not (clean / "faults.csv").exists()
+
+
+def test_board_scan_logs_every_input_fault(rig, capsys):
+    cfg, tmp = rig
+    bs.cmd_calibrate_step(build_parser().parse_args(["calibrate-step"]), cfg)
+    run = _scan(cfg, tmp, "faulty", "--fault", "input", "--fault-bits", "8", "--fault-seed", "3")
+    rows = list(csv.DictReader((run / "faults.csv").open()))
+    assert rows and all(r["mode"] == "input" and r["flipped"].count(":") == 8 for r in rows)
+    assert "faults: input, 8 bit(s) per inference, seed 3" in capsys.readouterr().out
+
+
+def test_dry_run_says_faults_are_on(rig, capsys):
+    cfg, tmp = rig
+    bs.cmd_calibrate_step(build_parser().parse_args(["calibrate-step"]), cfg)
+    capsys.readouterr()
+    args = build_parser().parse_args(["board-scan", "--dry-run", "--fault", "output", "--fault-bits", "2"])
+    assert bs.cmd_board_scan(args, cfg) == 0
+    assert "FAULTS       output: 2 random bit(s)" in capsys.readouterr().out

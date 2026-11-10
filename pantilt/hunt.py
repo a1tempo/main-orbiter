@@ -38,6 +38,7 @@ from .board_scan import (
 )
 from .config import Config
 from .controller import PanTilt
+from .fault import fault_settings, wrap_for_scan
 
 
 # -- geometry ------------------------------------------------------------------
@@ -365,7 +366,7 @@ def run_hunt(args, cfg: Config, corners: list[Corner], crop: float, threshold: f
         "refine_steps": s.refine_steps, "find_frames": s.find_frames,
         "confirm_frames": s.confirm_frames, "max_candidates": s.max_candidates,
         "cooldown_deg": cooldown.min_deg, "cooldown_s": cooldown_s, "speed_dps": speed,
-        "hef": str(hef),
+        "hef": str(hef), "fault": fault_settings(args),
     }, indent=2))
 
     progress = {"mode": "scan + revisit", "stage": "starting", "photos": 0}
@@ -400,10 +401,19 @@ def run_hunt(args, cfg: Config, corners: list[Corner], crop: float, threshold: f
                      "action", "photo", *names])
 
     camera = None
+    fault_log = injector = None
     t_start = time.time()
     try:
-        with HailoClassifier(str(hef)) as clf, PanTilt(cfg) as pt:
+        with HailoClassifier(str(hef), raw_output=bool(getattr(args, "fault", None))) as clf, \
+                PanTilt(cfg) as pt:
             pt_ref["pt"] = pt
+
+            def where():
+                p, t = pt.position
+                return {"pan": f"{p:.2f}" if p is not None else "",
+                        "tilt": f"{t:.2f}" if t is not None else "", "stage": progress["stage"]}
+
+            classify, injector, fault_log = wrap_for_scan(clf, args, cfg, run, where)
             camera = _Camera(cfg, preview=not args.no_preview, port=args.port, status=status,
                              thumb=_thumb_source(cam_ref, crop))
             cam_ref["camera"] = camera
@@ -460,7 +470,7 @@ def run_hunt(args, cfg: Config, corners: list[Corner], crop: float, threshold: f
                     seen = None
                     if centres:
                         seen = watch(
-                            camera.grab, lambda f: score_windows([f], centres, side, clf.classify),
+                            camera.grab, lambda f: score_windows([f], centres, side, classify),
                             target_i, s.find_frames, s.watch_min_s, s.watch_max_s,
                             rise_level=s.look_threshold / 2, stop_at=threshold,
                             on_update=lambda p, t: p is not None and show(p, f"{where} watching {t:.1f}s"))
@@ -511,7 +521,7 @@ def run_hunt(args, cfg: Config, corners: list[Corner], crop: float, threshold: f
                     c.id = i
                     progress["stage"] = f"revisit {i}/{len(order)}"
                     where = f"revisit {i}/{len(order)}"
-                    _confirm(c, aim, camera, pt, step, corners, side, clf.classify, s, target_i,
+                    _confirm(c, aim, camera, pt, step, corners, side, classify, s, target_i,
                              threshold, lambda p, t, w=where: show(p, f"{w} watching {t:.1f}s"))
                     show(np.asarray(c.probs), where)
                     action = "near-miss"
@@ -552,6 +562,9 @@ def run_hunt(args, cfg: Config, corners: list[Corner], crop: float, threshold: f
             camera.close()
         win_log.close()
         cand_log.close()
+        if fault_log:
+            fault_log.close()
+            print(injector.summary())
         n = len(cooldown.saved)
         print(f"\n{n} photo{'' if n == 1 else 's'} in {time.time() - t_start:.0f}s -> {run}")
     return 0

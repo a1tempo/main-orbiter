@@ -87,6 +87,39 @@ releases the servos, `q` quits. With `--gui` the same keys work in the window,
 and each one also has a button. `--log`, `--crop` and `--step` work as usual,
 and the browser live view runs alongside unless you add `--no-preview`.
 
+## Fault injection (input / output of the Hailo chip)
+
+The model on the chip is never changed. Faults are random bit flips in the data
+going **in** (the 8-bit 224 x 224 x 3 frame) or coming **out** (the chip's raw
+8-bit output, one byte per class). Each inference is also run clean, so every
+fault is compared with the correct (golden) answer.
+
+| What | Command |
+|---|---|
+| Live: aim with the arrow keys, clean vs faulty label side by side | `pantilt fi --fault output --fault-bits 1` |
+| Same, flipping bits in the input frame | `pantilt fi --fault input --fault-bits 4` |
+| In a window | `pantilt fi --fault output --fault-bits 1 --gui` |
+| No keyboard, print as it runs | `pantilt fi --fault output --fault-bits 2 --no-keys` |
+| A whole board scan with faults | `pantilt board-scan --fault input --fault-bits 4 --threshold 0.5` |
+
+| Option | Meaning |
+|---|---|
+| `--fault input` / `output` | Where the bits are flipped |
+| `--fault-bits K` | Random bits flipped per inference (default 1). `0` = a clean run through the same path |
+| `--fault-seed N` | Seed for the random flips (default 0): same seed, same flips |
+| `--fault-log file.csv` | (`fi` only) where to save the log, default `data/fi/fi-<time>.csv` |
+
+`fi` takes all of `live`'s options (`--crop`, `--gui`, `--no-keys`, `--scan`, ...)
+and judges every frame on its own (no smoothing), so each fault's effect shows.
+`board-scan --fault` writes `faults.csv` into the run folder and records the
+settings in `run.json`.
+
+Every log row is one inference: `golden` vs `pred` (faulty), `changed`,
+the crater probability before and after, `target_changed` (crater found or lost
+because of the fault), and `flipped`, the exact bits: `crater:7` = bit 7 of the
+crater output byte, `120,64,1:3` = bit 3 of pixel row 120, column 64, channel 1.
+At the end it prints how often the answer changed.
+
 ## Servos and hardware
 
 | What | Command |

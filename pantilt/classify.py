@@ -64,12 +64,19 @@ def preprocess(frame: np.ndarray, size: int = INPUT_SIZE, crop: float = 1.0) -> 
 
 
 class HailoClassifier:
-    """Keeps the Hailo pipeline open so each frame costs one inference call."""
+    """Keeps the Hailo pipeline open so each frame costs one inference call.
 
-    def __init__(self, hef_path: str):
+    raw_output=True asks the chip for its quantized 8-bit output instead of
+    HailoRT's float conversion, so the exact bytes it returns can be inspected
+    or corrupted (see fault.py). classify() still returns probabilities.
+    """
+
+    def __init__(self, hef_path: str, raw_output: bool = False):
         self.hef_path = hef_path
+        self.raw_output = raw_output
         self._stack = None
         self._pipeline = None
+        self.out_scale, self.out_zp = 1.0, 0.0  # raw output -> probability
 
     def open(self) -> "HailoClassifier":
         from contextlib import ExitStack
@@ -81,7 +88,10 @@ class HailoClassifier:
 
         hef = HEF(self.hef_path)
         self.input_name = hef.get_input_vstream_infos()[0].name
-        self.output_name = hef.get_output_vstream_infos()[0].name
+        out_info = hef.get_output_vstream_infos()[0]
+        self.output_name = out_info.name
+        self.out_scale = float(out_info.quant_info.qp_scale)
+        self.out_zp = float(out_info.quant_info.qp_zp)
 
         stack = ExitStack()
         try:
@@ -89,7 +99,8 @@ class HailoClassifier:
             params = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
             network_group = target.configure(hef, params)[0]
             in_params = InputVStreamParams.make(network_group, format_type=FormatType.UINT8)
-            out_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
+            out_format = FormatType.UINT8 if self.raw_output else FormatType.FLOAT32
+            out_params = OutputVStreamParams.make(network_group, format_type=out_format)
             self._pipeline = stack.enter_context(InferVStreams(network_group, in_params, out_params))
             stack.enter_context(network_group.activate(network_group.create_params()))
         except BaseException:
@@ -100,10 +111,24 @@ class HailoClassifier:
 
     def classify(self, x: np.ndarray) -> np.ndarray:
         """x from preprocess() -> class probabilities, shape (len(CLASS_NAMES),)."""
+        if self.raw_output:
+            return self.dequant(self.infer_raw(x))
+        return np.asarray(self._infer(x), dtype=np.float32).reshape(-1)
+
+    def infer_raw(self, x: np.ndarray) -> np.ndarray:
+        """x from preprocess() -> the chip's 8-bit output bytes (needs raw_output=True)."""
+        if not self.raw_output:
+            raise RuntimeError("open the classifier with raw_output=True to get the 8-bit output")
+        return np.asarray(self._infer(x), dtype=np.uint8).reshape(-1)
+
+    def dequant(self, q: np.ndarray) -> np.ndarray:
+        """8-bit output -> probabilities, using the conversion HailoRT reports for it."""
+        return (np.asarray(q, dtype=np.float32) - self.out_zp) * self.out_scale
+
+    def _infer(self, x: np.ndarray):
         if self._pipeline is None:
             raise RuntimeError("classifier is closed - call open() before classify()")
-        out = self._pipeline.infer({self.input_name: x})
-        return np.asarray(out[self.output_name], dtype=np.float32).reshape(-1)
+        return self._pipeline.infer({self.input_name: x})[self.output_name]
 
     def close(self) -> None:
         if self._stack:

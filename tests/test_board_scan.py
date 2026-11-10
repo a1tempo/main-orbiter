@@ -201,7 +201,7 @@ def test_full_scan_with_fake_hardware(tmp_path, monkeypatch):
     calls = {"n": 0}
 
     class FakeHailo:
-        def __init__(self, hef): pass
+        def __init__(self, hef, raw_output=False): pass
         def __enter__(self): return self
         def __exit__(self, *e): pass
         def classify(self, x):

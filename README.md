@@ -396,6 +396,7 @@ pantilt/
   clean.py       `clean`: delete saved photos from data/runs
   cli.py         `pantilt` command line
   gui.py         `--gui` window for `keys`, `teach` and `live` (tkinter)
+  fault.py       bit-flip fault injection on the chip's 8-bit input/output (`fi`, `board-scan --fault`)
 config.toml      hardware and model settings
 models/          compiled Hailo model (.hef) for `pantilt live`
 find_bounds.py   free arrow-key control with live angles (no limits)

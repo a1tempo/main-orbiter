@@ -16,6 +16,7 @@ from .controller import PanTilt
 from .scan import raster
 from .board_scan import cmd_board_scan, cmd_calibrate_step, cmd_teach
 from .clean import cmd_clean
+from .fault import add_fault_args
 from .survey import cmd_measure_k, cmd_survey
 
 
@@ -292,6 +293,8 @@ def cmd_live(args, cfg) -> int:
 
     def status():
         d = dict(live.status()) if live else {}
+        if injector:
+            d.update(injector.status())
         d["crop"] = f"{crop:.2f}"
         pt = pt_ref.get("pt")
         if pt:
@@ -303,15 +306,23 @@ def cmd_live(args, cfg) -> int:
     live = None
     log = writer = None
     camera = None
+    fault = getattr(args, "fault", None)  # set by `pantilt fi`
+    injector = fault_log = None
     try:
-        with HailoClassifier(str(hef)) as clf, PanTilt(cfg) as pt:
+        with HailoClassifier(str(hef), raw_output=bool(fault)) as clf, PanTilt(cfg) as pt:
             pt_ref["pt"] = pt
+            classify = clf.classify
+            if fault:
+                injector, fault_log = _fault_setup(args, cfg, clf, pt)
+                classify = injector.classify
             camera = _Camera(cfg, preview=not args.no_preview, port=args.port,
                              status=status, thumb=thumb)
             cam_ref["camera"] = camera
             time.sleep(1)  # let auto-exposure settle
-            live = LiveClassifier(camera.grab, clf.classify, smooth=m.smooth_frames, crop=crop,
-                                  min_confidence=m.min_confidence)
+            # With faults on, judge every frame on its own: smoothing would blend
+            # faulty frames with clean-looking ones and hide what each fault did.
+            live = LiveClassifier(camera.grab, classify, smooth=1 if fault else m.smooth_frames,
+                                  crop=crop, min_confidence=m.min_confidence)
             if args.log:
                 Path(args.log).parent.mkdir(parents=True, exist_ok=True)
                 log = open(args.log, "w", newline="")
@@ -332,15 +343,16 @@ def cmd_live(args, cfg) -> int:
                 print(f"live view: {camera.url}")
             live.start()
 
+            extra = injector.text if injector else None
             try:
                 if args.scan:
                     _live_scan(args, cfg, pt, live, record)
                 elif args.no_keys:
-                    _live_print(live, record, m.log_every_s)
+                    _live_print(live, record, m.log_every_s, extra)
                 elif args.gui:
-                    _live_gui(args, cfg, pt, camera, live, record, m.log_every_s, crop)
+                    _live_gui(args, cfg, pt, camera, live, record, m.log_every_s, crop, extra)
                 else:
-                    _live_keys(args, cfg, pt, live, record, m.log_every_s, camera.url)
+                    _live_keys(args, cfg, pt, live, record, m.log_every_s, camera.url, extra)
             finally:
                 # Must happen while the pipeline is still open: if the `with`
                 # closes it first, the thread's next infer() hits a None and
@@ -353,9 +365,31 @@ def cmd_live(args, cfg) -> int:
             camera.close()
         if log:
             log.close()
+        if fault_log:
+            fault_log.close()
+            print(f"\n{injector.summary()}\nper-frame log: {fault_log.path}")
     if live and live.error:
         raise live.error
     return 0
+
+
+def _fault_setup(args, cfg, clf, pt):
+    """`pantilt fi`: the injector wrapping the raw-output classifier, and its CSV log."""
+    from datetime import datetime
+
+    from .fault import FaultInjector, FaultLog
+
+    log = FaultLog(args.fault_log or f"data/fi/fi-{datetime.now():%Y%m%d-%H%M%S}.csv")
+
+    def where():
+        pan, tilt = pt.position
+        return {"pan": _fmt(pan), "tilt": _fmt(tilt), "stage": "live"}
+
+    injector = FaultInjector(clf, args.fault, args.fault_bits, args.fault_seed,
+                             target=cfg.sweep.target, log=log.write, context=where)
+    print(f"faults: {args.fault}, {args.fault_bits} bit(s) per frame, seed {args.fault_seed} "
+          f"-> {log.path}")
+    return injector, log
 
 
 def _class_names():
@@ -373,13 +407,15 @@ def _check(live):
         raise live.error
 
 
-def _live_print(live, record, every):
+def _live_print(live, record, every, extra=None):
     """Headless: print one line per interval until Ctrl+C."""
     while True:
         time.sleep(every)
         _check(live)
         p = live.latest
         print(f"{p.label:<14} {p.confidence * 100:5.1f}%   {p.fps:5.1f} fps   hailo {p.infer_ms:.1f} ms")
+        if extra:
+            print("  " + extra().replace("\n", "\n  "))
         record()
 
 
@@ -413,7 +449,7 @@ def _live_text(live, url) -> str:
     ])
 
 
-def _live_gui(args, cfg, pt, camera, live, record, every, crop):
+def _live_gui(args, cfg, pt, camera, live, record, every, crop, extra=None):
     """`live --gui`: the aiming window, with the live classification in its readout."""
     from .gui import run_gui
 
@@ -427,11 +463,12 @@ def _live_gui(args, cfg, pt, camera, live, record, every, crop):
             last["log"] = now
 
     run_gui(cfg, teach=False, crop=crop, corners_file=cfg.sweep.corners_file, step=args.step,
-            pt=pt, camera=camera, extra=lambda: _live_text(live, camera.url), on_tick=on_tick,
-            title="Live landmark classification")
+            pt=pt, camera=camera, on_tick=on_tick,
+            extra=lambda: _live_text(live, camera.url) + (f"\n\n{extra()}" if extra else ""),
+            title="Fault injection" if extra else "Live landmark classification")
 
 
-def _live_keys(args, cfg, pt, live, record, every, url):
+def _live_keys(args, cfg, pt, live, record, every, url, extra=None):
     import curses
 
     def loop(scr):
@@ -464,6 +501,7 @@ def _live_keys(args, cfg, pt, live, record, every, url):
                 f"fps   = {p.fps:5.1f}    hailo = {p.infer_ms:5.1f} ms",
                 f"pan   = {_fmt(pan):>5}    tilt  = {_fmt(tilt):>5}    step = {step} deg",
                 "",
+                *(extra().split("\n") + [""] if extra else []),
                 "arrows: move   +/-: step   c: center   r: release   q: quit",
                 msg,
             ]
@@ -574,6 +612,7 @@ def build_parser() -> argparse.ArgumentParser:
     bs.add_argument("--grid", action="store_true", help="old one-look-per-square grid, no revisits")
     bs.add_argument("--wide", action="store_true", help="find from one frame of the whole board instead of walking the grid")
     bs.add_argument("--lock-exposure", action="store_true", help="freeze exposure/white balance at the start of the run")
+    add_fault_args(bs)
     bs.add_argument("--one-way", action="store_true", help="(--grid) every row left to right instead of serpentine")
     bs.add_argument("--dry-run", action="store_true", help="print the grid, move nothing")
     bs.add_argument("--trace", action="store_true", help="walk every grid point without classifying, to check coverage")
@@ -597,21 +636,33 @@ def build_parser() -> argparse.ArgumentParser:
     cl.set_defaults(func=cmd_clean)
 
     lv = sub.add_parser("live", help="real-time landmark classification on the Hailo-8")
-    lv.add_argument("--hef", help="compiled model (default: [model] hef_path in config.toml)")
-    lv.add_argument("--crop", type=float, help="fraction of the frame to classify, centered (0-1]")
-    lv.add_argument("--log", metavar="CSV", help="save predictions with pan/tilt to a CSV file")
-    lv.add_argument("--no-preview", action="store_true", help="don't serve the browser live view")
-    lv.add_argument("--port", type=int, help="live view port (default: preview_port)")
-    lv.add_argument("--no-keys", action="store_true", help="no keyboard control; print predictions")
-    lv.add_argument("--gui", action="store_true", help="aim and watch the classification in a window instead of the terminal screen")
-    lv.add_argument("--step", type=int, default=2, help="degrees per key press (default 2)")
-    lv.add_argument("--scan", action="store_true", help="raster-scan and classify at each pose")
-    lv.add_argument("--pan", nargs=2, type=float, metavar=("MIN", "MAX"), help="scan pan range")
-    lv.add_argument("--tilt", nargs=2, type=float, metavar=("MIN", "MAX"), help="scan tilt range")
-    lv.add_argument("--cols", type=int, default=5, help="scan poses per row (default 5)")
-    lv.add_argument("--rows", type=int, default=3, help="scan rows (default 3)")
+    _live_args(lv)
     lv.set_defaults(func=cmd_live)
+
+    fi = sub.add_parser("fi", help="live classification with bit flips in the chip's 8-bit input or output")
+    _live_args(fi)
+    add_fault_args(fi, required=True)
+    fi.add_argument("--fault-log", metavar="CSV",
+                    help="per-frame fault log (default: data/fi/fi-<timestamp>.csv)")
+    fi.set_defaults(func=cmd_live)
     return p
+
+
+def _live_args(p) -> None:
+    """Options shared by `live` and `fi`."""
+    p.add_argument("--hef", help="compiled model (default: [model] hef_path in config.toml)")
+    p.add_argument("--crop", type=float, help="fraction of the frame to classify, centered (0-1]")
+    p.add_argument("--log", metavar="CSV", help="save predictions with pan/tilt to a CSV file")
+    p.add_argument("--no-preview", action="store_true", help="don't serve the browser live view")
+    p.add_argument("--port", type=int, help="live view port (default: preview_port)")
+    p.add_argument("--no-keys", action="store_true", help="no keyboard control; print predictions")
+    p.add_argument("--gui", action="store_true", help="aim and watch the classification in a window instead of the terminal screen")
+    p.add_argument("--step", type=int, default=2, help="degrees per key press (default 2)")
+    p.add_argument("--scan", action="store_true", help="raster-scan and classify at each pose")
+    p.add_argument("--pan", nargs=2, type=float, metavar=("MIN", "MAX"), help="scan pan range")
+    p.add_argument("--tilt", nargs=2, type=float, metavar=("MIN", "MAX"), help="scan tilt range")
+    p.add_argument("--cols", type=int, default=5, help="scan poses per row (default 5)")
+    p.add_argument("--rows", type=int, default=3, help="scan rows (default 3)")
 
 
 def main(argv=None) -> int:

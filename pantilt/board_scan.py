@@ -594,8 +594,12 @@ def cmd_board_scan(args, cfg: Config) -> int:
         return _find_mode(args, cfg, crop, corners, threshold, cooldown_s, speed)
     if args.lock_exposure:
         print("note: --lock-exposure only applies to the scan + revisit modes; ignoring it")
+    if args.fault and (args.trace or args.trace_edges):
+        print("note: --trace doesn't classify, so --fault has nothing to inject into; ignoring it")
 
     print(_describe(cfg, crop, tile, source, poses, threshold, cooldown_deg, cooldown_s, speed))
+    if args.fault and not (args.trace or args.trace_edges):
+        print(_fault_line(args))
     print()
 
     if args.dry_run:
@@ -609,6 +613,11 @@ def cmd_board_scan(args, cfg: Config) -> int:
         return _trace(cfg, crop, poses, speed, args.trace_edges, hold)
     return _scan(args, cfg, crop, corners, tile, source, poses, threshold, cooldown_deg,
                  cooldown_s, speed)
+
+
+def _fault_line(args) -> str:
+    return (f"FAULTS       {args.fault}: {args.fault_bits} random bit(s) flipped per inference, "
+            f"seed {args.fault_seed} (logged to <run>/faults.csv)")
 
 
 def _find_mode(args, cfg: Config, crop, corners, threshold, cooldown_s, speed) -> int:
@@ -628,6 +637,8 @@ def _find_mode(args, cfg: Config, crop, corners, threshold, cooldown_s, speed) -
 
     side, poses, stride, n_windows = hunt.plan_summary(cfg, corners, step, crop, args.wide)
     print(hunt.describe(cfg, crop, side, poses, stride, n_windows, threshold, args.wide))
+    if args.fault:
+        print(_fault_line(args))
     print()
     if args.dry_run:
         for p in poses:
@@ -679,6 +690,7 @@ def _scan(args, cfg, crop, corners, tile, source, poses, threshold, cooldown_deg
           speed) -> int:
     from .classify import CLASS_NAMES, HailoClassifier, LiveClassifier
     from .cli import _Camera, _thumb_source
+    from .fault import fault_settings, wrap_for_scan
 
     s, m = cfg.sweep, cfg.model
     hef = Path(args.hef or m.hef_path)
@@ -721,10 +733,11 @@ def _scan(args, cfg, crop, corners, tile, source, poses, threshold, cooldown_deg
         "target": s.target, "threshold": threshold,
         "cooldown_deg": cooldown_deg, "cooldown_s": cooldown_s,
         "speed_dps": speed, "settle_s": s.settle_s, "settle_max_s": s.settle_max_s,
-        "still_diff": s.still_diff, "hef": str(hef),
+        "still_diff": s.still_diff, "hef": str(hef), "fault": fault_settings(args),
     }, indent=2))
 
     camera = None
+    fault_log = injector = None
     log = open(run / "poses.csv", "w", newline="")
     writer = csv.writer(log)
     writer.writerow(["pass", "index", "row", "col", "pan", "tilt", "time", "settle_ms", "still",
@@ -732,15 +745,23 @@ def _scan(args, cfg, crop, corners, tile, source, poses, threshold, cooldown_deg
                      *[f"p_{n.replace(' ', '_')}" for n in CLASS_NAMES]])
     t_start = time.time()
     try:
-        with HailoClassifier(str(hef)) as clf, PanTilt(cfg) as pt:
+        with HailoClassifier(str(hef), raw_output=bool(getattr(args, "fault", None))) as clf, \
+                PanTilt(cfg) as pt:
             pt_ref["pt"] = pt
+
+            def where():
+                p, t = pt.position
+                return {"pan": f"{p:.2f}" if p is not None else "",
+                        "tilt": f"{t:.2f}" if t is not None else "", "stage": progress["pose"]}
+
+            classify, injector, fault_log = wrap_for_scan(clf, args, cfg, run, where)
             camera = _Camera(cfg, preview=not args.no_preview, port=args.port, status=status,
                              thumb=_thumb_source(cam_ref, crop))
             cam_ref["camera"] = camera
             if camera.url:
                 print(f"live view: {camera.url}")
             time.sleep(1)  # let auto-exposure settle
-            live = LiveClassifier(camera.grab, clf.classify, smooth=m.smooth_frames, crop=crop,
+            live = LiveClassifier(camera.grab, classify, smooth=m.smooth_frames, crop=crop,
                                   min_confidence=m.min_confidence)
             live.start()
             pt.center(smooth=False)
@@ -762,6 +783,9 @@ def _scan(args, cfg, crop, corners, tile, source, poses, threshold, cooldown_deg
         if camera:
             camera.close()
         log.close()
+        if fault_log:
+            fault_log.close()
+            print(injector.summary())
         n = len(cooldown.saved)
         print(f"\n{n} photo{'' if n == 1 else 's'} in {time.time() - t_start:.0f}s -> {run}")
     if live and live.error:
