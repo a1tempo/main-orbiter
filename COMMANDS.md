@@ -1,5 +1,7 @@
 # Command reference
 
+> For a step-by-step walkthrough of setting up and running the demo, see [DEMO_GUIDE.md](DEMO_GUIDE.md).
+
 Every command, in one place. Run them on the Pi from the project folder with
 the venv active:
 

@@ -60,7 +60,7 @@ pantilt check
 
 ## Usage
 
-> **All commands on one page:** [COMMANDS.md](COMMANDS.md)
+> **Running the demo:** step-by-step [DEMO_GUIDE.md](DEMO_GUIDE.md) · **All commands on one page:** [COMMANDS.md](COMMANDS.md)
 
 ```bash
 pantilt check                 # I2C bus, PCA9685 at 0x40, Hailo on PCIe
