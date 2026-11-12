@@ -720,6 +720,8 @@ def _scan(args, cfg, crop, corners, tile, source, poses, threshold, cooldown_deg
         d = {"mode": "board scan", **progress}
         if live:
             d.update(live.status())
+        if injector:
+            d.update(injector.status())
         d["crop"] = f"{crop:.2f}"
         if "pt" in pt_ref:
             p, t = pt_ref["pt"].position
@@ -765,15 +767,37 @@ def _scan(args, cfg, crop, corners, tile, source, poses, threshold, cooldown_deg
                                   min_confidence=m.min_confidence)
             live.start()
             pt.center(smooth=False)
-            try:
+
+            def scan(stop=None):
                 n_pass = 0
                 while args.passes == 0 or n_pass < args.passes:
                     n_pass += 1
                     progress["pass"] = n_pass
                     for pose in poses:
+                        if stop is not None and stop.is_set():
+                            raise KeyboardInterrupt  # the --gui window was closed
                         progress["pose"] = f"{pose.index + 1}/{len(poses)}"
                         _visit(pose, n_pass, pt, camera, live, cooldown, writer, log, run, progress,
                                s, crop, m.smooth_frames, target_i, threshold, speed)
+
+            def watch_text():
+                p = live.latest
+                lines = [f"GRID SCAN     pose {progress['pose']}    pass {progress['pass']}    "
+                         f"state: {progress['state']}    photos: {progress['photos']}", "",
+                         f"Model         {p.label} {100 * p.confidence:.0f}%"]
+                if injector:
+                    lines += ["", injector.text()]
+                return "\n".join(lines)
+
+            try:
+                if getattr(args, "gui", False):
+                    from .gui import run_watch
+
+                    if not run_watch(cfg, camera=camera, crop=crop, work=scan, text=watch_text,
+                                     title="Fault injection: grid scan" if injector else "Grid scan"):
+                        return 1
+                else:
+                    scan()
             finally:
                 live.stop()  # before the pipeline closes - see cmd_live
             pt.center()
@@ -785,7 +809,7 @@ def _scan(args, cfg, crop, corners, tile, source, poses, threshold, cooldown_deg
         log.close()
         if fault_log:
             fault_log.close()
-            print(injector.summary())
+            print(f"{injector.report()}\nPer-inference log: {fault_log.path}")
         n = len(cooldown.saved)
         print(f"\n{n} photo{'' if n == 1 else 's'} in {time.time() - t_start:.0f}s -> {run}")
     if live and live.error:

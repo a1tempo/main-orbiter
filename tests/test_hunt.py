@@ -444,3 +444,59 @@ def test_dry_run_says_faults_are_on(rig, capsys):
     args = build_parser().parse_args(["board-scan", "--dry-run", "--fault", "output", "--fault-bits", "2"])
     assert bs.cmd_board_scan(args, cfg) == 0
     assert "FAULTS       output: 2 random bit(s)" in capsys.readouterr().out
+
+
+def _watch_capture(monkeypatch, stop_first=False):
+    """Replace the --gui window: run the scan in place and keep what it would show."""
+    import threading
+
+    import pantilt.gui as gui
+
+    seen = {"texts": []}
+
+    def fake_watch(cfg, *, camera, crop, work, text, title, extra_actions=None):
+        stop = threading.Event()
+        if stop_first:
+            stop.set()
+        seen["title"] = title
+        seen["texts"].append(text())
+        work(stop)
+        seen["texts"].append(text())
+        return True
+
+    monkeypatch.setattr(gui, "run_watch", fake_watch)
+    return seen
+
+
+def test_board_scan_gui_shows_the_scan_and_fault_stats(rig, monkeypatch):
+    cfg, tmp = rig
+    bs.cmd_calibrate_step(build_parser().parse_args(["calibrate-step"]), cfg)
+    seen = _watch_capture(monkeypatch)
+    run = _scan(cfg, tmp, "gui", "--gui", "--fault", "output", "--fault-bits", "0")
+    assert seen["title"] == "Fault injection: board scan"
+    end = seen["texts"][-1]
+    assert "BOARD SCAN" in end and "photos saved: 1" in end
+    assert "FAULT INJECTION" in end and "n/a in board-scan" in end
+    assert [c for c in csv.DictReader((run / "candidates.csv").open()) if c["action"] == "saved"]
+
+
+def test_board_scan_gui_without_faults_and_in_grid_mode(rig, monkeypatch):
+    cfg, tmp = rig
+    bs.cmd_calibrate_step(build_parser().parse_args(["calibrate-step"]), cfg)
+    seen = _watch_capture(monkeypatch)
+    _scan(cfg, tmp, "plain", "--gui")
+    assert seen["title"] == "Board scan" and "FAULT INJECTION" not in seen["texts"][-1]
+    seen = _watch_capture(monkeypatch)
+    _scan(cfg, tmp, "grid", "--gui", "--grid", "--fault", "input", "--fault-bits", "2")
+    assert seen["title"] == "Fault injection: grid scan" and "GRID SCAN" in seen["texts"][-1]
+
+
+def test_closing_the_board_scan_window_stops_the_scan(rig, monkeypatch):
+    cfg, tmp = rig
+    bs.cmd_calibrate_step(build_parser().parse_args(["calibrate-step"]), cfg)
+    _watch_capture(monkeypatch, stop_first=True)
+    args = build_parser().parse_args(["board-scan", "--gui", "--hef", str(tmp / "m.hef"),
+                                      "--out", str(tmp / "stopped"), "--no-preview"])
+    with pytest.raises(KeyboardInterrupt):          # main() turns this into "stopped"
+        bs.cmd_board_scan(args, cfg)
+    assert (tmp / "stopped" / "candidates.csv").exists()   # logs were closed cleanly

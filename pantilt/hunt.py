@@ -383,12 +383,35 @@ def run_hunt(args, cfg: Config, corners: list[Corner], crop: float, threshold: f
 
     def status():
         d = dict(progress)
+        if injector:
+            d.update(injector.status())
         d["crop"] = f"{crop:.2f}"
         if "pt" in pt_ref:
             p, t = pt_ref["pt"].position
             d["pan"] = p if p is not None else "-"
             d["tilt"] = t if t is not None else "-"
         return d
+
+    def watch_text():
+        """The --gui readout: where the scan is, what the model sees, and the faults."""
+        d = progress
+        pan, tilt = pt_ref["pt"].position if "pt" in pt_ref else (None, None)
+        where = f"pan {pan:.1f}  tilt {tilt:.1f}" if pan is not None else ""
+        lines = [
+            f"BOARD SCAN    stage: {d.get('stage', '-')}    pass {d.get('pass', '-')}",
+            f"              {where}",
+            f"              points of interest: {d.get('interest', 0)}    photos saved: {d.get('photos', 0)}",
+        ]
+        if f"{s.target} %" in d:
+            lines += [
+                "",
+                f"Model         {s.target}: {d[f'{s.target} %']:.0f}%    top: {d.get('top', '-')}"
+                f"    next: {d.get('#2', '-')}",
+                f"              ({d.get('scored', '')})",
+            ]
+        if injector:
+            lines += ["", injector.text()]
+        return "\n".join(lines)
 
     names = [f"p_{n.replace(' ', '_')}" for n in CLASS_NAMES]
     win_log = open(run / "windows.csv", "w", newline="")
@@ -422,141 +445,155 @@ def run_hunt(args, cfg: Config, corners: list[Corner], crop: float, threshold: f
             time.sleep(1)  # let auto-exposure settle
             pt.center(smooth=False)
 
-            def aim(pan, tilt):
-                pt.move_to(pan=pan, tilt=tilt, speed_dps=speed, ease=True)
-                time.sleep(s.settle_s)
-                return wait_still(camera.grab, s.still_diff, s.settle_max_s - s.settle_s)
+            def scan(stop=None):
+                """The whole run; with --gui it runs behind the window, which can stop it."""
+                def aim(pan, tilt):
+                    if stop is not None and stop.is_set():
+                        raise KeyboardInterrupt  # the --gui window was closed
+                    pt.move_to(pan=pan, tilt=tilt, speed_dps=speed, ease=True)
+                    time.sleep(s.settle_s)
+                    return wait_still(camera.grab, s.still_diff, s.settle_max_s - s.settle_s)
 
-            mid = (sum(p for p, _ in corners) / 4, sum(t for _, t in corners) / 4)
-            if getattr(args, "lock_exposure", False):
-                progress["stage"] = "locking exposure"
-                aim(*mid)
-                time.sleep(1.5)  # let auto-exposure settle on the board itself
-                locked = lock_exposure(camera.cam)
-                time.sleep(0.5)  # a few frames for the new controls to take effect
-                info = json.loads((run / "run.json").read_text())
-                info["exposure_locked"] = locked
-                (run / "run.json").write_text(json.dumps(info, indent=2))
-                print(f"exposure locked: {locked['ExposureTime'] / 1000:.1f} ms, "
-                      f"gain {locked['AnalogueGain']:.2f}")
-                if locked["AnalogueGain"] > 3.0:
-                    print("warning: gain is high - the board is underlit, scores will suffer. "
-                          "Add light.", file=sys.stderr)
-
-            n_pass = 0
-            while args.passes == 0 or n_pass < args.passes:
-                n_pass += 1
-                progress["pass"] = n_pass
-
-                # 0. one picture of the whole board, to draw the results on
-                found, overviews = [], []
-                if not wide:
-                    progress["stage"] = "overview"
+                mid = (sum(p for p, _ in corners) / 4, sum(t for _, t in corners) / 4)
+                if getattr(args, "lock_exposure", False):
+                    progress["stage"] = "locking exposure"
                     aim(*mid)
-                    frame = camera.grab()
-                    overviews.append((frame, View(step, frame.shape[1], frame.shape[0], *pt.position)))
+                    time.sleep(1.5)  # let auto-exposure settle on the board itself
+                    locked = lock_exposure(camera.cam)
+                    time.sleep(0.5)  # a few frames for the new controls to take effect
+                    info = json.loads((run / "run.json").read_text())
+                    info["exposure_locked"] = locked
+                    (run / "run.json").write_text(json.dumps(info, indent=2))
+                    print(f"exposure locked: {locked['ExposureTime'] / 1000:.1f} ms, "
+                          f"gain {locked['AnalogueGain']:.2f}")
+                    if locked["AnalogueGain"] > 3.0:
+                        print("warning: gain is high - the board is underlit, scores will suffer. "
+                              "Add light.", file=sys.stderr)
 
-                # 1. scan (or, with --wide, look at the whole board at once)
-                label = "find" if wide else "scan"
-                for k, pose in enumerate(poses):
-                    progress["stage"] = f"{label} {k + 1}/{len(poses)}"
-                    still = aim(pose.pan, pose.tilt)
-                    first = camera.grab()
-                    view = View(step, first.shape[1], first.shape[0], *pt.position)
-                    centres = (windows if wide else local_windows)(view, corners, side, stride,
-                                                                   s.edge_margin)
-                    t0 = time.time()
-                    where = f"{label} {k + 1}/{len(poses)}"
-                    seen = None
-                    if centres:
-                        seen = watch(
-                            camera.grab, lambda f: score_windows([f], centres, side, classify),
-                            target_i, s.find_frames, s.watch_min_s, s.watch_max_s,
-                            rise_level=s.look_threshold / 2, stop_at=threshold,
-                            on_update=lambda p, t: p is not None and show(p, f"{where} watching {t:.1f}s"))
-                    probs = seen.probs if seen else []
-                    frames = seen.frames if seen and seen.frames else [first]
-                    for (x, y), p in zip(centres, probs):
-                        pan, tilt = view.to_angle(x, y)
-                        win_w.writerow([n_pass, k, x, y, f"{pan:.2f}", f"{tilt:.2f}",
-                                        f"{p[target_i]:.4f}", CLASS_NAMES[int(np.argmax(p))],
-                                        *[f"{v:.4f}" for v in p]])
-                        if p[target_i] >= s.look_threshold:
-                            found.append(Candidate(pan, tilt, float(p[target_i]), k, x, y))
-                    win_log.flush()
-                    best_i = int(np.argmax([p[target_i] for p in probs])) if probs else -1
-                    best = float(probs[best_i][target_i]) if probs else 0.0
-                    if probs:
-                        show(probs[best_i], f"{label} {k + 1}/{len(poses)} (best window)")
-                    progress["interest"] = len(pick_candidates(found, 0.5 * square_deg, s.max_candidates))
-                    shake = "" if still else "  [still shaking]"
-                    if seen and seen.rising:
-                        shake += "  [still rising when time ran out]"
-                    if wide:
-                        print(f"find {k + 1}/{len(poses)}: {len(centres)} windows, watched "
-                              f"{time.time() - t0:.1f}s, best {s.target} {best:.2f}{shake}")
-                        overviews.append((frames[0], view))
-                    else:
-                        top = CLASS_NAMES[int(np.argmax(probs[best_i]))] if probs else "-"
-                        flag = "  <- point of interest" if best >= s.look_threshold else ""
-                        print(f"  scan [{k + 1}/{len(poses)}] pan {pose.pan:6.2f} tilt {pose.tilt:6.2f}  "
-                              f"best {s.target} {best:.2f}  (top {top}, {time.time() - t0:.1f}s)"
-                              f"{shake}{flag}")
+                n_pass = 0
+                while args.passes == 0 or n_pass < args.passes:
+                    n_pass += 1
+                    progress["pass"] = n_pass
 
-                cands = pick_candidates(found, 0.5 * square_deg, s.max_candidates)
-                print(f"\n{len(found)} windows over {s.look_threshold:.2f} -> "
-                      f"{len(cands)} point{'' if len(cands) == 1 else 's'} of interest to go back to")
+                    # 0. one picture of the whole board, to draw the results on
+                    found, overviews = [], []
+                    if not wide:
+                        progress["stage"] = "overview"
+                        aim(*mid)
+                        frame = camera.grab()
+                        overviews.append((frame, View(step, frame.shape[1], frame.shape[0], *pt.position)))
 
-                # 2. confirm, nearest first so the mount doesn't zig-zag
-                here = pt.position
-                order = []
-                todo = list(cands)
-                while todo:
-                    nxt = min(todo, key=lambda c: math.hypot(c.pan - here[0], c.tilt - here[1]))
-                    todo.remove(nxt)
-                    order.append(nxt)
-                    here = (nxt.pan, nxt.tilt)
+                    # 1. scan (or, with --wide, look at the whole board at once)
+                    label = "find" if wide else "scan"
+                    for k, pose in enumerate(poses):
+                        progress["stage"] = f"{label} {k + 1}/{len(poses)}"
+                        still = aim(pose.pan, pose.tilt)
+                        first = camera.grab()
+                        view = View(step, first.shape[1], first.shape[0], *pt.position)
+                        centres = (windows if wide else local_windows)(view, corners, side, stride,
+                                                                       s.edge_margin)
+                        t0 = time.time()
+                        where = f"{label} {k + 1}/{len(poses)}"
+                        seen = None
+                        if centres:
+                            seen = watch(
+                                camera.grab, lambda f: score_windows([f], centres, side, classify),
+                                target_i, s.find_frames, s.watch_min_s, s.watch_max_s,
+                                rise_level=s.look_threshold / 2, stop_at=threshold,
+                                on_update=lambda p, t: p is not None and show(p, f"{where} watching {t:.1f}s"))
+                        probs = seen.probs if seen else []
+                        frames = seen.frames if seen and seen.frames else [first]
+                        for (x, y), p in zip(centres, probs):
+                            pan, tilt = view.to_angle(x, y)
+                            win_w.writerow([n_pass, k, x, y, f"{pan:.2f}", f"{tilt:.2f}",
+                                            f"{p[target_i]:.4f}", CLASS_NAMES[int(np.argmax(p))],
+                                            *[f"{v:.4f}" for v in p]])
+                            if p[target_i] >= s.look_threshold:
+                                found.append(Candidate(pan, tilt, float(p[target_i]), k, x, y))
+                        win_log.flush()
+                        best_i = int(np.argmax([p[target_i] for p in probs])) if probs else -1
+                        best = float(probs[best_i][target_i]) if probs else 0.0
+                        if probs:
+                            show(probs[best_i], f"{label} {k + 1}/{len(poses)} (best window)")
+                        progress["interest"] = len(pick_candidates(found, 0.5 * square_deg, s.max_candidates))
+                        shake = "" if still else "  [still shaking]"
+                        if seen and seen.rising:
+                            shake += "  [still rising when time ran out]"
+                        if wide:
+                            print(f"find {k + 1}/{len(poses)}: {len(centres)} windows, watched "
+                                  f"{time.time() - t0:.1f}s, best {s.target} {best:.2f}{shake}")
+                            overviews.append((frames[0], view))
+                        else:
+                            top = CLASS_NAMES[int(np.argmax(probs[best_i]))] if probs else "-"
+                            flag = "  <- point of interest" if best >= s.look_threshold else ""
+                            print(f"  scan [{k + 1}/{len(poses)}] pan {pose.pan:6.2f} tilt {pose.tilt:6.2f}  "
+                                  f"best {s.target} {best:.2f}  (top {top}, {time.time() - t0:.1f}s)"
+                                  f"{shake}{flag}")
 
-                for i, c in enumerate(order, 1):
-                    c.id = i
-                    progress["stage"] = f"revisit {i}/{len(order)}"
-                    where = f"revisit {i}/{len(order)}"
-                    _confirm(c, aim, camera, pt, step, corners, side, classify, s, target_i,
-                             threshold, lambda p, t, w=where: show(p, f"{w} watching {t:.1f}s"))
-                    show(np.asarray(c.probs), where)
-                    action = "near-miss"
-                    if c.confirm_p >= threshold:
-                        now = time.monotonic()
-                        action = cooldown.check(c.pan, c.tilt, now)
-                        if action == "save":
-                            frame = c.frame
-                            n = len(cooldown.saved) + 1
-                            stem = (f"{n:03d}_p{c.pan:05.1f}_t{c.tilt:05.1f}_"
-                                    f"{s.target.replace(' ', '-')}{c.confirm_p:.2f}")
-                            c.photo = f"{stem}.jpg"
-                            _save_photo(run / "photos" / c.photo, frame[:, :, :3])
-                            _save_photo(run / "photos" / f"{stem}_crop.png",
-                                        crop_at(frame, *c.xy, side))
-                            cooldown.record(c.pan, c.tilt, now)
-                            progress["photos"] = len(cooldown.saved)
-                            action = "saved"
-                    c.action = action
-                    cand_w.writerow([n_pass, c.id, f"{c.pan:.2f}", f"{c.tilt:.2f}", f"{c.find_p:.4f}",
-                                     f"{c.confirm_p:.4f}", c.moves, f"{c.watched_s:.1f}", action, c.photo,
-                                     *[f"{v:.4f}" for v in c.probs]])
-                    cand_log.flush()
-                    note = {"saved": f"  -> PHOTO {c.photo}", "near-miss": "  (near miss, logged)",
-                            "near": "  (already photographed nearby)", "wait": "  (cooldown)",
-                            "cap": "  (photo limit reached)"}.get(action, "")
-                    print(f"  [{i}/{len(order)}] pan {c.pan:6.2f} tilt {c.tilt:6.2f}  "
-                          f"find {c.find_p:.2f} -> {c.confirm_p:.2f}  ({c.watched_s:.1f}s){note}")
-                    c.frame = None  # don't hold every frame in memory
+                    cands = pick_candidates(found, 0.5 * square_deg, s.max_candidates)
+                    print(f"\n{len(found)} windows over {s.look_threshold:.2f} -> "
+                          f"{len(cands)} point{'' if len(cands) == 1 else 's'} of interest to go back to")
 
-                for k, (frame, view) in enumerate(overviews):
-                    mine = order if not wide else [c for c in order if c.find_pose == k]
-                    _overview(run / f"overview_p{n_pass}_{k}.jpg", frame, view, corners, side,
-                              mine, [] if wide else poses)
-            pt.center()
+                    # 2. confirm, nearest first so the mount doesn't zig-zag
+                    here = pt.position
+                    order = []
+                    todo = list(cands)
+                    while todo:
+                        nxt = min(todo, key=lambda c: math.hypot(c.pan - here[0], c.tilt - here[1]))
+                        todo.remove(nxt)
+                        order.append(nxt)
+                        here = (nxt.pan, nxt.tilt)
+
+                    for i, c in enumerate(order, 1):
+                        c.id = i
+                        progress["stage"] = f"revisit {i}/{len(order)}"
+                        where = f"revisit {i}/{len(order)}"
+                        _confirm(c, aim, camera, pt, step, corners, side, classify, s, target_i,
+                                 threshold, lambda p, t, w=where: show(p, f"{w} watching {t:.1f}s"))
+                        show(np.asarray(c.probs), where)
+                        action = "near-miss"
+                        if c.confirm_p >= threshold:
+                            now = time.monotonic()
+                            action = cooldown.check(c.pan, c.tilt, now)
+                            if action == "save":
+                                frame = c.frame
+                                n = len(cooldown.saved) + 1
+                                stem = (f"{n:03d}_p{c.pan:05.1f}_t{c.tilt:05.1f}_"
+                                        f"{s.target.replace(' ', '-')}{c.confirm_p:.2f}")
+                                c.photo = f"{stem}.jpg"
+                                _save_photo(run / "photos" / c.photo, frame[:, :, :3])
+                                _save_photo(run / "photos" / f"{stem}_crop.png",
+                                            crop_at(frame, *c.xy, side))
+                                cooldown.record(c.pan, c.tilt, now)
+                                progress["photos"] = len(cooldown.saved)
+                                action = "saved"
+                        c.action = action
+                        cand_w.writerow([n_pass, c.id, f"{c.pan:.2f}", f"{c.tilt:.2f}", f"{c.find_p:.4f}",
+                                         f"{c.confirm_p:.4f}", c.moves, f"{c.watched_s:.1f}", action, c.photo,
+                                         *[f"{v:.4f}" for v in c.probs]])
+                        cand_log.flush()
+                        note = {"saved": f"  -> PHOTO {c.photo}", "near-miss": "  (near miss, logged)",
+                                "near": "  (already photographed nearby)", "wait": "  (cooldown)",
+                                "cap": "  (photo limit reached)"}.get(action, "")
+                        print(f"  [{i}/{len(order)}] pan {c.pan:6.2f} tilt {c.tilt:6.2f}  "
+                              f"find {c.find_p:.2f} -> {c.confirm_p:.2f}  ({c.watched_s:.1f}s){note}")
+                        c.frame = None  # don't hold every frame in memory
+
+                    for k, (frame, view) in enumerate(overviews):
+                        mine = order if not wide else [c for c in order if c.find_pose == k]
+                        _overview(run / f"overview_p{n_pass}_{k}.jpg", frame, view, corners, side,
+                                  mine, [] if wide else poses)
+                pt.center()
+
+            if getattr(args, "gui", False):
+                from .gui import run_watch
+
+                label = "Fault injection: board scan" if injector else "Board scan"
+                if not run_watch(cfg, camera=camera, crop=crop, work=scan, text=watch_text,
+                                 title=label):
+                    return 1
+            else:
+                scan()
     finally:
         if camera:
             camera.close()
@@ -564,7 +601,7 @@ def run_hunt(args, cfg: Config, corners: list[Corner], crop: float, threshold: f
         cand_log.close()
         if fault_log:
             fault_log.close()
-            print(injector.summary())
+            print(f"{injector.report()}\nPer-inference log: {fault_log.path}")
         n = len(cooldown.saved)
         print(f"\n{n} photo{'' if n == 1 else 's'} in {time.time() - t_start:.0f}s -> {run}")
     return 0

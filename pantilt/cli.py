@@ -343,16 +343,17 @@ def cmd_live(args, cfg) -> int:
                 print(f"live view: {camera.url}")
             live.start()
 
-            extra = injector.text if injector else None
             try:
-                if args.scan:
-                    _live_scan(args, cfg, pt, live, record)
+                if args.scan and args.gui:
+                    _live_scan_gui(args, cfg, pt, camera, live, record, crop, injector)
+                elif args.scan:
+                    _live_scan(args, cfg, pt, live, record, injector=injector)
                 elif args.no_keys:
-                    _live_print(live, record, m.log_every_s, extra)
+                    _live_print(live, record, m.log_every_s, injector)
                 elif args.gui:
-                    _live_gui(args, cfg, pt, camera, live, record, m.log_every_s, crop, extra)
+                    _live_gui(args, cfg, pt, camera, live, record, m.log_every_s, crop, injector)
                 else:
-                    _live_keys(args, cfg, pt, live, record, m.log_every_s, camera.url, extra)
+                    _live_keys(args, cfg, pt, live, record, m.log_every_s, camera.url, injector)
             finally:
                 # Must happen while the pipeline is still open: if the `with`
                 # closes it first, the thread's next infer() hits a None and
@@ -367,7 +368,7 @@ def cmd_live(args, cfg) -> int:
             log.close()
         if fault_log:
             fault_log.close()
-            print(f"\n{injector.summary()}\nper-frame log: {fault_log.path}")
+            print(f"{injector.report()}\nPer-frame log: {fault_log.path}")
     if live and live.error:
         raise live.error
     return 0
@@ -386,7 +387,8 @@ def _fault_setup(args, cfg, clf, pt):
         return {"pan": _fmt(pan), "tilt": _fmt(tilt), "stage": "live"}
 
     injector = FaultInjector(clf, args.fault, args.fault_bits, args.fault_seed,
-                             target=cfg.sweep.target, log=log.write, context=where)
+                             target=cfg.sweep.target, log=log.write, context=where,
+                             label=args.label)
     print(f"faults: {args.fault}, {args.fault_bits} bit(s) per frame, seed {args.fault_seed} "
           f"-> {log.path}")
     return injector, log
@@ -407,35 +409,79 @@ def _check(live):
         raise live.error
 
 
-def _live_print(live, record, every, extra=None):
-    """Headless: print one line per interval until Ctrl+C."""
+def _live_print(live, record, every, injector=None):
+    """Headless: print one line per interval until Ctrl+C.
+
+    With faults on, the lines form a table: what the latest frame did, then
+    running totals, so the columns can be compared at a glance.
+    """
+    if injector:
+        print(injector.table_header())
     while True:
         time.sleep(every)
         _check(live)
-        p = live.latest
-        print(f"{p.label:<14} {p.confidence * 100:5.1f}%   {p.fps:5.1f} fps   hailo {p.infer_ms:.1f} ms")
-        if extra:
-            print("  " + extra().replace("\n", "\n  "))
+        if injector:
+            print(injector.table_row())
+        else:
+            p = live.latest
+            print(f"{p.label:<14} {p.confidence * 100:5.1f}%   {p.fps:5.1f} fps   hailo {p.infer_ms:.1f} ms")
         record()
 
 
-def _live_scan(args, cfg, pt, live, record):
-    """Raster-scan; at each pose wait for fresh frames, then log the prediction."""
+def _live_scan(args, cfg, pt, live, record, injector=None, stop=None, progress=None):
+    """Raster-scan; at each pose wait for fresh frames, then log the prediction.
+
+    stop (a threading.Event, from the --gui window) ends the scan between steps;
+    progress (a dict) tells the window which pose the scan is on.
+    """
+    def check():
+        _check(live)
+        if stop is not None and stop.is_set():
+            raise KeyboardInterrupt
+
     pan_range = tuple(args.pan) if args.pan else (cfg.pan.min_angle, cfg.pan.max_angle)
     tilt_range = tuple(args.tilt) if args.tilt else (cfg.tilt.min_angle, cfg.tilt.max_angle)
     poses = list(raster(pan_range, tilt_range, args.cols, args.rows))
+    if injector:
+        print(injector.table_header())
     for i, (pan, tilt) in enumerate(poses):
+        check()
+        if progress is not None:
+            progress["pose"] = f"{i + 1}/{len(poses)}"
         pt.move_to(pan=pan, tilt=tilt, settle=True)
         start = live.latest.frames
         # Wait until the smoothing window holds only frames taken at this pose.
-        while live.latest.frames - start < cfg.model.smooth_frames + 1:
-            _check(live)
+        frames = 1 if injector else cfg.model.smooth_frames
+        while live.latest.frames - start < frames + 1:
+            check()
             time.sleep(0.01)
         p = live.latest
         record()
-        top = ", ".join(f"{n} {v * 100:.0f}%" for n, v in p.top3)
-        print(f"[{i + 1}/{len(poses)}] pan={pan:.1f} tilt={tilt:.1f} -> {top}")
+        if injector:
+            print(injector.table_row())
+        else:
+            top = ", ".join(f"{n} {v * 100:.0f}%" for n, v in p.top3)
+            print(f"[{i + 1}/{len(poses)}] pan={pan:.1f} tilt={tilt:.1f} -> {top}")
+    if progress is not None:
+        progress["pose"] = "done"
     pt.center()
+
+
+def _live_scan_gui(args, cfg, pt, camera, live, record, crop, injector=None):
+    """`live/fi --scan --gui`: the raster scan runs by itself while a window shows the camera."""
+    from .gui import run_watch
+
+    progress = {"pose": "starting"}
+
+    def text():
+        pan, tilt = pt.position
+        head = (f"SCANNING  pose {progress['pose']}   pan {_fmt(pan)}  tilt {_fmt(tilt)}\n\n")
+        return head + (injector.text() if injector else _live_text(live, camera.url))
+
+    run_watch(cfg, camera=camera, crop=crop, title="Fault injection scan" if injector else "Live scan",
+              text=text, work=lambda stop: _live_scan(args, cfg, pt, live, record, injector,
+                                                      stop, progress),
+              extra_actions=[("Next label", "l", injector.cycle_label)] if injector else None)
 
 
 def _live_text(live, url) -> str:
@@ -449,7 +495,7 @@ def _live_text(live, url) -> str:
     ])
 
 
-def _live_gui(args, cfg, pt, camera, live, record, every, crop, extra=None):
+def _live_gui(args, cfg, pt, camera, live, record, every, crop, injector=None):
     """`live --gui`: the aiming window, with the live classification in its readout."""
     from .gui import run_gui
 
@@ -464,11 +510,12 @@ def _live_gui(args, cfg, pt, camera, live, record, every, crop, extra=None):
 
     run_gui(cfg, teach=False, crop=crop, corners_file=cfg.sweep.corners_file, step=args.step,
             pt=pt, camera=camera, on_tick=on_tick,
-            extra=lambda: _live_text(live, camera.url) + (f"\n\n{extra()}" if extra else ""),
-            title="Fault injection" if extra else "Live landmark classification")
+            extra=(lambda: injector.text()) if injector else (lambda: _live_text(live, camera.url)),
+            extra_actions=[("Next label", "l", injector.cycle_label)] if injector else None,
+            title="Fault injection" if injector else "Live landmark classification")
 
 
-def _live_keys(args, cfg, pt, live, record, every, url, extra=None):
+def _live_keys(args, cfg, pt, live, record, every, url, injector=None):
     import curses
 
     def loop(scr):
@@ -501,8 +548,9 @@ def _live_keys(args, cfg, pt, live, record, every, url, extra=None):
                 f"fps   = {p.fps:5.1f}    hailo = {p.infer_ms:5.1f} ms",
                 f"pan   = {_fmt(pan):>5}    tilt  = {_fmt(tilt):>5}    step = {step} deg",
                 "",
-                *(extra().split("\n") + [""] if extra else []),
-                "arrows: move   +/-: step   c: center   r: release   q: quit",
+                *(injector.text().split("\n") + [""] if injector else []),
+                "arrows: move   +/-: step   c: center   r: release   q: quit"
+                + ("   l: next label" if injector else ""),
                 msg,
             ]
             for y, text in enumerate(rows):
@@ -532,6 +580,9 @@ def _live_keys(args, cfg, pt, live, record, every, url, extra=None):
             elif k in (ord("r"), ord("R")):
                 pt.release()
                 msg = "released - next arrow key re-engages"
+            elif injector and k in (ord("l"), ord("L")):
+                injector.cycle_label()
+                msg = f"label: {injector.label_name}"
             elif k in (ord("q"), ord("Q"), 27):
                 break
 
@@ -612,6 +663,7 @@ def build_parser() -> argparse.ArgumentParser:
     bs.add_argument("--grid", action="store_true", help="old one-look-per-square grid, no revisits")
     bs.add_argument("--wide", action="store_true", help="find from one frame of the whole board instead of walking the grid")
     bs.add_argument("--lock-exposure", action="store_true", help="freeze exposure/white balance at the start of the run")
+    bs.add_argument("--gui", action="store_true", help="watch the scan in a window: camera, scores and fault stats")
     add_fault_args(bs)
     bs.add_argument("--one-way", action="store_true", help="(--grid) every row left to right instead of serpentine")
     bs.add_argument("--dry-run", action="store_true", help="print the grid, move nothing")
@@ -644,6 +696,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_fault_args(fi, required=True)
     fi.add_argument("--fault-log", metavar="CSV",
                     help="per-frame fault log (default: data/fi/fi-<timestamp>.csv)")
+    fi.add_argument("--label", choices=_class_names(),
+                    help="what the camera is really looking at, for true accuracy (L key changes it)")
     fi.set_defaults(func=cmd_live)
     return p
 

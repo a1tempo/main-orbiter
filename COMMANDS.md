@@ -96,29 +96,45 @@ fault is compared with the correct (golden) answer.
 
 | What | Command |
 |---|---|
-| Live: aim with the arrow keys, clean vs faulty label side by side | `pantilt fi --fault output --fault-bits 1` |
-| Same, flipping bits in the input frame | `pantilt fi --fault input --fault-bits 4` |
-| In a window | `pantilt fi --fault output --fault-bits 1 --gui` |
-| No keyboard, print as it runs | `pantilt fi --fault output --fault-bits 2 --no-keys` |
-| A whole board scan with faults | `pantilt board-scan --fault input --fault-bits 4 --threshold 0.5` |
+| Live: aim by hand, clean vs faulty side by side | `pantilt fi --fault output --fault-bits 1` |
+| Same, in a window with the camera | `pantilt fi --fault output --fault-bits 1 --gui` |
+| With the true label, for real accuracy | `pantilt fi --fault output --fault-bits 1 --gui --label crater` |
+| A printed table instead of a screen | `pantilt fi --fault output --fault-bits 2 --no-keys` |
+| Automatic raster scan, watched in a window | `pantilt fi --fault output --scan --gui` |
+| A whole board scan with faults, watched in a window | `pantilt board-scan --fault input --fault-bits 4 --gui` |
 
 | Option | Meaning |
 |---|---|
 | `--fault input` / `output` | Where the bits are flipped |
 | `--fault-bits K` | Random bits flipped per inference (default 1). `0` = a clean run through the same path |
 | `--fault-seed N` | Seed for the random flips (default 0): same seed, same flips |
+| `--label CLASS` | (`fi` only) what the camera is really looking at; **L** (key or button) cycles it |
+| `--gui` | Window with the camera, red box and the fault readout. For `--scan` and `board-scan` the servos move by themselves; **q** or closing the window stops the scan |
 | `--fault-log file.csv` | (`fi` only) where to save the log, default `data/fi/fi-<time>.csv` |
 
-`fi` takes all of `live`'s options (`--crop`, `--gui`, `--no-keys`, `--scan`, ...)
-and judges every frame on its own (no smoothing), so each fault's effect shows.
-`board-scan --fault` writes `faults.csv` into the run folder and records the
-settings in `run.json`.
+**What the numbers mean**
 
-Every log row is one inference: `golden` vs `pred` (faulty), `changed`,
-the crater probability before and after, `target_changed` (crater found or lost
-because of the fault), and `flipped`, the exact bits: `crater:7` = bit 7 of the
-crater output byte, `120,64,1:3` = bit 3 of pixel row 120, column 64, channel 1.
-At the end it prints how often the answer changed.
+| Number | Meaning |
+|---|---|
+| **changed** | Share of frames where the fault gave a different answer from the clean model |
+| **agree** | The opposite: accuracy with the clean model as the reference |
+| **conf.** | Average change in the clean answer's confidence, in points (negative = the faults cost confidence; a flip can also add some) |
+| **accuracy clean -> faulty** | Only while a label is set: how often the clean and the faulty answers match the label, and the drop between them |
+| **crater found or lost** | Frames where a fault made a crater appear or disappear |
+| **By bit** (report) | For each bit position, how often flipping it changed the answer |
+
+For accuracy against the truth, aim at one kind of feature, set `--label` (or
+press **L**) to match, and keep the camera on it. Change the label when you
+aim somewhere else. Frames without a label still count toward everything else.
+`board-scan` has no single label, so there the clean model is the reference.
+
+`fi` judges every frame on its own (no smoothing) so each fault's effect shows.
+`board-scan --fault` writes `faults.csv` into the run folder and records the
+settings in `run.json`. Each log row is one inference: clean vs faulty answer,
+confidence, label and whether each was right, and `flipped`, the exact bits
+(`crater:7` = bit 7 of the crater output byte, `120,64,1:3` = bit 3 of pixel
+row 120, column 64, channel 1). A report with all of the above is printed when
+the run ends.
 
 ## Servos and hardware
 

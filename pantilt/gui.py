@@ -110,10 +110,11 @@ class AimSession:
 
 def run_gui(cfg: Config, *, teach: bool, crop: float, corners_file: str | Path,
             step: float = 2, pt=None, camera=None, extra=None, on_tick=None,
-            title: str | None = None) -> int:
+            title: str | None = None, extra_actions=None) -> int:
     """Open the window. Pass pt / camera to reuse ones the caller already has open
     (`pantilt live` does, so the classifier keeps reading the same camera).
     extra() returns more text for the readout; on_tick() runs with every frame.
+    extra_actions adds (label, keys, function) buttons, e.g. `fi`'s label key.
     """
     try:
         import tkinter as tk
@@ -161,8 +162,8 @@ def run_gui(cfg: Config, *, teach: bool, crop: float, corners_file: str | Path,
 
         side = tk.Frame(root, padx=10, pady=10)
         side.grid(row=0, column=1, sticky="n")
-        readout = tk.Label(side, justify="left", anchor="nw", font=("Menlo", 12), width=34,
-                           height=24 if extra else 14)
+        readout = tk.Label(side, justify="left", anchor="nw", font=("Menlo", 12),
+                           width=74 if extra else 34, height=26 if extra else 14)
         readout.pack(anchor="w")
 
         def save():
@@ -183,6 +184,7 @@ def run_gui(cfg: Config, *, teach: bool, crop: float, corners_file: str | Path,
                 ("Go to the marks", "g", session.revisit),
                 ("Save and finish", "s", save),
             ]
+        actions += list(extra_actions or [])
         actions.append(("Quit", "q", root.destroy))
 
         keys = {
@@ -245,3 +247,104 @@ def run_gui(cfg: Config, *, teach: bool, crop: float, corners_file: str | Path,
         return 0
     print("quit without saving")
     return 1
+
+
+def run_watch(cfg: Config, *, camera, crop: float, work, text, title: str,
+              extra_actions=None) -> bool:
+    """A window showing the camera while an automatic scan runs on its own.
+
+    work(stop) runs in a background thread and moves the servos itself; the
+    window only watches: the live picture with the crosshair and red box, and
+    text() refreshed beside it. Closing the window, or Stop (q), sets `stop`,
+    which the scan checks between moves. An exception from the scan (including
+    the stop) is raised again here once the window has closed.
+
+    Returns False, having started nothing, if no window can be opened.
+    """
+    try:
+        import tkinter as tk
+    except ImportError:
+        print("tkinter is missing: sudo apt install python3-tk")
+        return False
+    from io import BytesIO
+
+    from PIL import Image
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        print(f"can't open a window ({e}). On the Pi, use its own monitor, or ssh -Y from a Mac.")
+        return False
+    root.title(title)
+
+    cw = 960
+    ch = round(cw * cfg.camera.preview_height / cfg.camera.preview_width)
+    box = crop * ch
+    canvas = tk.Canvas(root, width=cw, height=ch, bg="black", highlightthickness=0)
+    canvas.grid(row=0, column=0)
+    picture = canvas.create_image(0, 0, anchor="nw")
+    x, y = cw / 2, ch / 2
+    canvas.create_line(x - 15, y, x + 15, y, fill="#00ff78")
+    canvas.create_line(x, y - 15, x, y + 15, fill="#00ff78")
+    canvas.create_rectangle(x - box / 2, y - box / 2, x + box / 2, y + box / 2,
+                            outline="#ff4646", width=2)
+
+    side = tk.Frame(root, padx=10, pady=10)
+    side.grid(row=0, column=1, sticky="n")
+    readout = tk.Label(side, justify="left", anchor="nw", font=("Menlo", 12), width=74, height=30)
+    readout.pack(anchor="w")
+
+    stop = threading.Event()
+    failure: list = []
+    state = {"done": False}
+
+    def run():
+        try:
+            work(stop)
+        except BaseException as e:  # the stop arrives as KeyboardInterrupt
+            failure.append(e)
+        finally:
+            state["done"] = True
+
+    def close():
+        stop.set()
+        root.destroy()
+
+    keys = {"Escape": close}
+    for label, chars, action in list(extra_actions or []) + [("Stop and close", "q", close)]:
+        tk.Button(side, text=f"{label} ({chars[0]})", command=action).pack(fill="x", pady=1)
+        keys.update(dict.fromkeys(chars, action))
+    root.bind("<Key>", lambda e: (keys.get(e.keysym) or keys.get(e.char.lower()) or (lambda: None))())
+    root.protocol("WM_DELETE_WINDOW", close)
+    root.focus_force()
+
+    def tick():
+        msg = ""
+        try:
+            frame = camera.grab()[:, :, :3]
+            buf = BytesIO()
+            Image.fromarray(frame).resize((cw, ch)).save(buf, "PPM")
+            canvas.photo = tk.PhotoImage(data=buf.getvalue())
+            canvas.itemconfig(picture, image=canvas.photo)
+        except Exception as e:
+            msg = f"camera: {e}"
+        body = text()
+        if state["done"]:
+            body += "\n\nFINISHED - close the window (q) for the full report."
+            root.title(f"{title} - finished")
+        readout.config(text=f"{body}\n{msg}".rstrip())
+        root.after(80, tick)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    tick()
+    try:
+        root.mainloop()
+    finally:
+        stop.set()
+        if worker.is_alive():
+            print("stopping the scan after its current step...")
+        worker.join()
+    if failure:
+        raise failure[0]
+    return True
