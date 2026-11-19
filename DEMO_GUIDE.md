@@ -16,9 +16,9 @@ lists every command and option.
 - [9. Settings in config.toml](#9-settings-in-configtoml)
 - [10. Troubleshooting](#10-troubleshooting)
 
-> **Which branch?** Fault injection (`pantilt fi`, `--fault`) is on the
-> `fault-injection` branch, not on `main` yet. Everything else is on both.
-> Check with `git status -sb`; the first line names the branch.
+> **Which branch?** Use `main`: it has everything, fault injection included.
+> Check with `git status -sb`; the first line names the branch and should say
+> `## main...origin/main`.
 
 ---
 
@@ -112,9 +112,9 @@ git stash && git pull && git stash pop
 ```
 The stash keeps your local `config.toml` edits (such as `crop = 0.2`).
 
-**First time on a branch the Pi doesn't have yet:**
+**If the Pi is on another branch,** switch to `main` first:
 ```bash
-git fetch origin fault-injection:fault-injection && git switch fault-injection
+git switch main && git stash && git pull && git stash pop
 ```
 
 **If the Pi has no internet,** send the branch straight from the Mac. Git won't
@@ -122,16 +122,18 @@ push into the branch the Pi has open, so step off it first.
 
 On the Pi:
 ```bash
-git switch main
+git stash && git switch --detach
 ```
 On the Mac:
 ```bash
-git push reem@reem-rpi.local:main-orbiter fault-injection:fault-injection
+git push reem@reem-rpi.local:main-orbiter main:main
 ```
 On the Pi again:
 ```bash
-git switch fault-injection && git log --oneline -1
+git switch main && git stash pop && git log --oneline -1
 ```
+The last line should show the same commit as `git log --oneline -1` on the Mac.
+If `git stash` said "No local changes to save", skip the `git stash pop`.
 
 ---
 
@@ -217,7 +219,7 @@ window shows the camera, the stage, the scores and the photo count. **q** stops 
 
 ## 6. Fault injection demo
 
-> On the `fault-injection` branch. Faults are random bit flips in the data
+> Faults are random bit flips in the data
 > going **into** the Hailo chip (the 8-bit image) or coming **out** of it (the
 > raw 8-bit answer). The model itself is never changed. Every frame is also run
 > clean, so each fault is compared with the correct answer.
@@ -422,11 +424,11 @@ commands also accept `--config path/to/config.toml` **before** the command name.
 | `--corners FILE` / `--hef FILE` | Other corners file / model |
 | `--no-preview` / `--port 8001` | Browser live view off / on another port |
 | `--dry-run` / `--trace` / `--trace-edges` | See [board setup](#board-setup) |
-| `--fault input/output --fault-bits K --fault-seed N` | Fault injection during the scan (fault-injection branch) |
+| `--fault input/output --fault-bits K --fault-seed N` | Fault injection during the scan |
 
 **Demo script:** `./scripts/demo.sh [--teach] [any board-scan options]`
 
-### Fault injection (fault-injection branch)
+### Fault injection
 
 `python3 -m pantilt fi --fault input|output` with any `live` option above, plus:
 
